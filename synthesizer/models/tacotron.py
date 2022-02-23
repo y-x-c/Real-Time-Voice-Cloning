@@ -37,7 +37,7 @@ class Encoder(nn.Module):
     def forward(self, x, speaker_embedding=None):
         x = self.embedding(x)
         x = self.pre_net(x)
-        x.transpose_(1, 2)
+        x = x.transpose(1, 2)
         x = self.cbhg(x)
         if speaker_embedding is not None:
             x = self.add_speaker_embedding(x, speaker_embedding)
@@ -176,10 +176,10 @@ class PreNet(nn.Module):
     def forward(self, x):
         x = self.fc1(x)
         x = F.relu(x)
-        x = F.dropout(x, self.p, training=True)
+        x = F.dropout(x, self.p, training=False)
         x = self.fc2(x)
         x = F.relu(x)
-        x = F.dropout(x, self.p, training=True)
+        x = F.dropout(x, self.p, training=False)
         return x
 
 
@@ -297,18 +297,20 @@ class Decoder(nn.Module):
 
         # Compute first Residual RNN
         rnn1_hidden_next, rnn1_cell = self.res_rnn1(x, (rnn1_hidden, rnn1_cell))
-        if self.training:
-            rnn1_hidden = self.zoneout(rnn1_hidden, rnn1_hidden_next)
-        else:
-            rnn1_hidden = rnn1_hidden_next
+        # if self.training:
+        #     rnn1_hidden = self.zoneout(rnn1_hidden, rnn1_hidden_next)
+        # else:
+        #     rnn1_hidden = rnn1_hidden_next
+        rnn1_hidden = rnn1_hidden_next
         x = x + rnn1_hidden
 
         # Compute second Residual RNN
         rnn2_hidden_next, rnn2_cell = self.res_rnn2(x, (rnn2_hidden, rnn2_cell))
-        if self.training:
-            rnn2_hidden = self.zoneout(rnn2_hidden, rnn2_hidden_next)
-        else:
-            rnn2_hidden = rnn2_hidden_next
+        # if self.training:
+        #     rnn2_hidden = self.zoneout(rnn2_hidden, rnn2_hidden_next)
+        # else:
+        #     rnn2_hidden = rnn2_hidden_next
+        rnn2_hidden = rnn2_hidden_next
         x = x + rnn2_hidden
 
         # Project Mels
@@ -471,6 +473,66 @@ class Tacotron(nn.Module):
         attn_scores = torch.cat(attn_scores, 1)
         stop_outputs = torch.cat(stop_outputs, 1)
 
+        self.train()
+
+        return mel_outputs, linear, attn_scores
+    
+    def generate_train(self, x, speaker_embedding=None, steps=2000):
+        device = next(self.parameters()).device  # use same device as parameters
+
+        batch_size, _  = x.size()
+
+        # Need to initialise all hidden states and pack into tuple for tidyness
+        attn_hidden = torch.zeros(batch_size, self.decoder_dims, device=device)
+        rnn1_hidden = torch.zeros(batch_size, self.lstm_dims, device=device)
+        rnn2_hidden = torch.zeros(batch_size, self.lstm_dims, device=device)
+        hidden_states = (attn_hidden, rnn1_hidden, rnn2_hidden)
+
+        # Need to initialise all lstm cell states and pack into tuple for tidyness
+        rnn1_cell = torch.zeros(batch_size, self.lstm_dims, device=device)
+        rnn2_cell = torch.zeros(batch_size, self.lstm_dims, device=device)
+        cell_states = (rnn1_cell, rnn2_cell)
+
+        # Need a <GO> Frame for start of decoder loop
+        go_frame = torch.zeros(batch_size, self.n_mels, device=device)
+
+        # Need an initial context vector
+        context_vec = torch.zeros(batch_size, self.encoder_dims + self.speaker_embedding_size, device=device)
+
+        # SV2TTS: Run the encoder with the speaker embedding
+        # The projection avoids unnecessary matmuls in the decoder loop
+        encoder_seq = self.encoder(x, speaker_embedding)
+        encoder_seq_proj = self.encoder_proj(encoder_seq)
+
+        # Need a couple of lists for outputs
+        mel_outputs, attn_scores, stop_outputs = [], [], []
+
+        # Run the decoder loop
+        for t in range(0, steps, self.r):
+            prenet_in = mel_outputs[-1][:, :, -1] if t > 0 else go_frame
+            mel_frames, scores, hidden_states, cell_states, context_vec, stop_tokens = \
+            self.decoder(encoder_seq, encoder_seq_proj, prenet_in,
+                         hidden_states, cell_states, context_vec, t, x)
+            mel_outputs.append(mel_frames)
+            attn_scores.append(scores)
+            stop_outputs.extend([stop_tokens] * self.r)
+            # Stop the loop when all stop tokens in batch exceed threshold
+            if (stop_tokens > 0.5).all() and t > 10: break
+
+        # Concat the mel outputs into sequence
+        mel_outputs = torch.cat(mel_outputs, dim=2)
+
+        # Post-Process for Linear Spectrograms
+        postnet_out = self.postnet(mel_outputs)
+        linear = self.post_proj(postnet_out)
+
+
+        linear = linear.transpose(1, 2)
+
+        # For easy visualisation
+        attn_scores = torch.cat(attn_scores, 1)
+        stop_outputs = torch.cat(stop_outputs, 1)
+        
         self.train()
 
         return mel_outputs, linear, attn_scores
