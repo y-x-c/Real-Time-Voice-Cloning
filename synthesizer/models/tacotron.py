@@ -176,10 +176,10 @@ class PreNet(nn.Module):
     def forward(self, x):
         x = self.fc1(x)
         x = F.relu(x)
-        x = F.dropout(x, self.p, training=False)
+        x = F.dropout(x, self.p, training=True)
         x = self.fc2(x)
         x = F.relu(x)
-        x = F.dropout(x, self.p, training=False)
+        x = F.dropout(x, self.p, training=True)
         return x
 
 
